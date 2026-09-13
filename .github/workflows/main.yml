@@ -1,40 +1,35 @@
-name: Daily Prothom Alo ePaper EPUB
+name: Daily Prothom Alo Print EPUB
 
 on:
   schedule:
-    # 01:00 UTC = 07:00 AM BST (Bangladesh Standard Time, UTC+6)
+    # 01:00 UTC = 07:00 AM BST (UTC+6)
     - cron: '0 1 * * *'
-  workflow_dispatch: # Allows manual trigger from UI anytime
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright system dependencies & Chromium
-        run: |
-          playwright install --with-deps chromium
-
-      - name: Run ePaper Scraper & EPUB Compiler
+      - name: Build Print Edition EPUB
         run: python build_epaper.py
 
-      - name: Upload Daily EPUB as Artifact
+      - name: Upload Daily EPUB
         uses: actions/upload-artifact@v4
         with:
-          name: Prothom-Alo-ePaper-${{ github.run_id }}
-          path: prothom_alo_epaper_*.epub
-          retention-days: 14
+          name: Prothom-Alo-EPUB-${{ github.run_id }}
+          path: prothom_alo_print_*.epub
+          retention-days: 7
