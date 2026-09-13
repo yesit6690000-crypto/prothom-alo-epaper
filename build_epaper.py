@@ -3,7 +3,9 @@ import requests
 from datetime import datetime
 from ebooklib import epub
 
-COOKIE = os.getenv("EPAPER_COOKIE", "").strip()
+# Retrieve cookie and sanitize invisible/non-ASCII characters (\u2060)
+raw_cookie = os.getenv("EPAPER_COOKIE", "")
+COOKIE = "".join(char for char in raw_cookie if ord(char) < 128).strip()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -20,8 +22,6 @@ def run():
     print(f"[*] Starting ePaper fetch for date: {today_str}")
     if not COOKIE:
         print("[!] WARNING: EPAPER_COOKIE environment variable is empty!")
-    else:
-        print("[*] EPAPER_COOKIE loaded successfully.")
 
     book = epub.EpubBook()
     book.set_identifier(f"prothom-alo-epaper-{today_str}")
@@ -40,61 +40,51 @@ def run():
     chapters = []
     spine = ['nav']
     
-    # Try fetching print broadsheet pages
     for page_num in range(1, 17):
-        # Primary ePaper image endpoint formats
-        urls_to_try = [
-            f"https://epaper.prothomalo.com/Home/GetPageImage?date={today_str}&page={page_num}&edition=dhaka",
-            f"https://epaper.prothomalo.com/epaper/GetPageImage?date={today_str}&page={page_num}"
-        ]
+        img_url = f"https://epaper.prothomalo.com/Home/GetPageImage?date={today_str}&page={page_num}&edition=dhaka"
         
-        page_fetched = False
-        for img_url in urls_to_try:
-            try:
-                res = requests.get(img_url, headers=HEADERS, timeout=15, allow_redirects=False)
-                content_type = res.headers.get("Content-Type", "")
-                
-                # Check if server returned a valid JPEG/PNG image binary
-                if res.status_code == 200 and ("image" in content_type or len(res.content) > 15000):
-                    img_item = epub.EpubItem(
-                        uid=f"page_img_{page_num}",
-                        file_name=f"images/page_{page_num}.jpg",
-                        media_type="image/jpeg",
-                        content=res.content
-                    )
-                    book.add_item(img_item)
+        try:
+            res = requests.get(img_url, headers=HEADERS, timeout=15, allow_redirects=False)
+            content_type = res.headers.get("Content-Type", "")
+            
+            if res.status_code == 200 and ("image" in content_type or len(res.content) > 15000):
+                img_item = epub.EpubItem(
+                    uid=f"page_img_{page_num}",
+                    file_name=f"images/page_{page_num}.jpg",
+                    media_type="image/jpeg",
+                    content=res.content
+                )
+                book.add_item(img_item)
 
-                    chapter = epub.EpubHtml(
-                        title=f"পাতা {page_num}",
-                        file_name=f"page_{page_num}.xhtml",
-                        lang="bn"
-                    )
-                    chapter.content = f"""
-                    <html>
-                    <head><title>পাতা {page_num}</title><link rel="stylesheet" href="style.css" type="text/css"/></head>
-                    <body>
-                        <div class="page"><img src="images/page_{page_num}.jpg" alt="Page {page_num}"/></div>
-                    </body>
-                    </html>
-                    """
-                    chapter.add_item(css_item)
-                    book.add_item(chapter)
-                    chapters.append(chapter)
-                    spine.append(chapter)
-                    print(f"[+] Downloaded Page {page_num} ({len(res.content)} bytes)")
-                    page_fetched = True
+                chapter = epub.EpubHtml(
+                    title=f"পাতা {page_num}",
+                    file_name=f"page_{page_num}.xhtml",
+                    lang="bn"
+                )
+                chapter.content = f"""
+                <html>
+                <head><title>পাতা {page_num}</title><link rel="stylesheet" href="style.css" type="text/css"/></head>
+                <body>
+                    <div class="page"><img src="images/page_{page_num}.jpg" alt="Page {page_num}"/></div>
+                </body>
+                </html>
+                """
+                chapter.add_item(css_item)
+                book.add_item(chapter)
+                chapters.append(chapter)
+                spine.append(chapter)
+                print(f"[+] Downloaded Page {page_num} ({len(res.content)} bytes)")
+            else:
+                print(f"[-] Page {page_num} response: HTTP {res.status_code} | Size: {len(res.content)} bytes")
+                if page_num > 2:
                     break
-                else:
-                    print(f"[-] Page {page_num} failed on {img_url} | HTTP {res.status_code} | Type: {content_type}")
-            except Exception as e:
-                print(f"[-] Request error on page {page_num}: {e}")
-
-        if not page_fetched and page_num > 2:
-            print(f"[*] Stopping at page {page_num - 1}.")
-            break
+        except Exception as e:
+            print(f"[-] Request error on page {page_num}: {e}")
+            if page_num > 2:
+                break
 
     if not chapters:
-        raise Exception("Failed to fetch ePaper pages. Re-check if EPAPER_COOKIE is valid and not expired.")
+        raise Exception("Failed to fetch ePaper pages. Verify that your secret cookie is still valid.")
 
     book.toc = tuple(chapters)
     book.add_item(epub.EpubNcx())
