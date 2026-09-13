@@ -1,4 +1,4 @@
-requests==2.32.3
-beautifulsoup4==4.12.3
-EbookLib==0.18
-lxml==5.2.2
+requests
+beautifulsoup4
+ebooklib
+playwright
