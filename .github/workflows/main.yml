@@ -1,8 +1,8 @@
-name: Daily Prothom Alo EPUB
+name: Daily Prothom Alo ePaper
 
 on:
   schedule:
-    - cron: '0 1 * * *' # Runs daily at 7:00 AM BST
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 jobs:
@@ -20,12 +20,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run generation script
+      - name: Run ePaper Scraper
+        env:
+          EPAPER_COOKIE: ${{ secrets.EPAPER_COOKIE }}
         run: python build_epaper.py
 
-      - name: Upload generated EPUB artifact
+      - name: Upload EPUB Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Prothom-Alo-EPUB-${{ github.run_id }}
-          path: prothom_alo_*.epub
+          name: Prothom-Alo-ePaper-${{ github.run_id }}
+          path: prothom_alo_epaper_*.epub
           retention-days: 7
