@@ -18,11 +18,13 @@ def get_authenticated_session():
 
     login_url = "https://epaper.prothomalo.com/Account/Login"
 
-    print("[*] Requesting login page for CSRF security token...")
+    print("[*] Requesting login page for verification token...")
     get_res = session.get(login_url, timeout=15)
+    
+    if get_res.status_code == 403 or "cloudflare" in get_res.text.lower():
+        print("[!] GitHub runner IP is being blocked by Cloudflare security.")
+        
     soup = BeautifulSoup(get_res.text, "html.parser")
-
-    # Extract ASP.NET verification token
     token_tag = soup.find("input", {"name": "__RequestVerificationToken"})
     token_val = token_tag.get("value", "") if token_tag else ""
 
@@ -33,13 +35,16 @@ def get_authenticated_session():
         "RememberMe": "true"
     }
 
-    print("[*] Submitting login credentials with token...")
+    print(f"[*] Submitting login for account target...")
     res = session.post(login_url, data=login_data, timeout=15)
+
+    print(f"[*] Status Code: {res.status_code}")
+    print(f"[*] Final URL: {res.url}")
 
     cookies = session.cookies.get_dict()
     if ".ASPXAUTH" not in cookies and "Logout" not in res.text and "logout" not in res.text.lower():
-        print(f"[-] Login Response Status: {res.status_code}")
-        raise Exception("Login failed. Double-check EPAPER_USER and EPAPER_PASS values in GitHub Secrets.")
+        print(f"[-] Server response snippet: {res.text[:250]}")
+        raise Exception("Login failed. Check logs above for response details.")
 
     print("[+] Login successful! Active session established.")
     return session
