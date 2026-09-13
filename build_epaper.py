@@ -38,57 +38,70 @@ async def main():
         await context.add_cookies(formatted_cookies)
         page = await context.new_page()
 
-        print("[*] Navigating to Prothom Alo ePaper...")
-        # Use domcontentloaded to avoid long-polling background timeouts
-        await page.goto("https://epaper.prothomalo.com/", wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(5000)
-
-        # Scrape clickable story blocks or map links
         scraped_stories = []
-        areas = await page.query_selector_all('map area, div.article-box, a.page-link, [data-article-id]')
-        print(f"[*] Found {len(areas)} potential article elements.")
 
-        for idx, area in enumerate(areas[:20]):
+        # Intercept JSON article payloads directly from backend network traffic
+        async def handle_response(response):
             try:
-                await area.click(force=True, timeout=3000)
-                await page.wait_for_timeout(1000)
-
-                story = await page.evaluate('''() => {
-                    const modal = document.querySelector('.modal-content, .article-detail-popup, #articleModal, .story-details, body');
-                    if (!modal) return null;
-
-                    const titleEl = modal.querySelector('h1, h2, .headline, .title');
-                    const title = titleEl ? titleEl.innerText.trim() : '';
-
-                    const imgs = Array.from(modal.querySelectorAll('img'))
-                        .map(i => i.src)
-                        .filter(src => src && !src.includes('logo') && !src.includes('icon'));
-
-                    const paragraphs = Array.from(modal.querySelectorAll('p, .content, .description'))
-                        .map(p => p.innerText.trim())
-                        .filter(t => t.length > 15);
-
-                    return {
-                        title: title,
-                        image_url: imgs.length > 0 ? imgs[0] : null,
-                        paragraphs: paragraphs
-                    };
-                }''')
-
-                if story and (story['title'] or story['paragraphs']):
-                    scraped_stories.append(story)
-                    print(f"[+] Scraped: {story['title'][:40]}...")
-
-                # Close modal view if open
-                close_btn = await page.query_selector('.close, .btn-close, .modal-close')
-                if close_btn:
-                    await close_btn.click(timeout=1000)
+                content_type = response.headers.get("content-type", "")
+                if "json" in content_type and response.status == 200:
+                    if any(k in response.url.lower() for k in ["article", "story", "getpage", "details"]):
+                        data = await response.json()
+                        items = data if isinstance(data, list) else [data]
+                        for item in items:
+                            title = item.get("Headline") or item.get("title") or item.get("Title") or ""
+                            content = item.get("Body") or item.get("content") or item.get("Description") or ""
+                            img = item.get("ImageUrl") or item.get("image") or None
+                            if title or content:
+                                scraped_stories.append({
+                                    "title": str(title).strip(),
+                                    "image_url": img,
+                                    "paragraphs": [p.strip() for p in str(content).split("\n") if len(p.strip()) > 10]
+                                })
             except Exception:
-                continue
+                pass
+
+        page.on("response", handle_response)
+
+        print("[*] Loading Prothom Alo ePaper portal...")
+        await page.goto("https://epaper.prothomalo.com/", wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(6000)
+
+        # Fallback: Scrape rendered article nodes directly from DOM
+        if not scraped_stories:
+            print("[*] Parsing story blocks from browser DOM...")
+            dom_stories = await page.evaluate('''() => {
+                const results = [];
+                const blocks = document.querySelectorAll('article, .story-box, .article-content, .page-story, map area, div[data-article-id]');
+                
+                blocks.forEach(b => {
+                    const title = b.getAttribute('title') || b.getAttribute('alt') || b.querySelector('h1, h2, h3, .title, .headline')?.innerText.trim() || '';
+                    const img = b.querySelector('img')?.src || null;
+                    const paras = Array.from(b.querySelectorAll('p, .desc')).map(p => p.innerText.trim()).filter(t => t.length > 15);
+                    
+                    if (title.length > 3 || paras.length > 0) {
+                        results.push({
+                            title: title,
+                            image_url: img,
+                            paragraphs: paras
+                        });
+                    }
+                });
+                return results;
+            }''')
+
+            for s in dom_stories:
+                if not any(existing['title'] == s['title'] for existing in scraped_stories if s['title']):
+                    scraped_stories.append(s)
 
         await browser.close()
 
-    # Package into Kindle Reflowable EPUB
+    print(f"[*] Total reflowable articles retrieved: {len(scraped_stories)}")
+
+    if not scraped_stories:
+        raise Exception("Could not extract article text. Please verify subscription login cookies.")
+
+    # Build Kindle Reflowable EPUB
     book = epub.EpubBook()
     book.set_identifier(f"prothom-alo-epaper-text-{today_str}")
     book.set_title(f"প্রথম আলো - {today_str}")
@@ -112,7 +125,7 @@ async def main():
 
     for i, story in enumerate(scraped_stories, start=1):
         img_html = ""
-        if story.get("image_url"):
+        if story.get("image_url") and str(story["image_url"]).startswith("http"):
             try:
                 res = session.get(story["image_url"], timeout=10)
                 if res.status_code == 200:
@@ -151,16 +164,13 @@ async def main():
         chapters.append(chapter)
         spine.append(chapter)
 
-    if not chapters:
-        raise Exception("Could not extract article text from portal.")
-
     book.toc = tuple(chapters)
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
     book.spine = spine
 
     epub.write_epub(output_filename, book, {})
-    print(f"[✓] Reflowable text+image EPUB generated: {output_filename}")
+    print(f"[✓] Reflowable EPUB created: {output_filename}")
 
 if __name__ == "__main__":
     asyncio.run(main())
