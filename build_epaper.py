@@ -1,78 +1,78 @@
 import os
-import re
 import json
-import requests
-from bs4 import BeautifulSoup
+import asyncio
 from datetime import datetime
+from playwright.async_api import async_playwright
 from ebooklib import epub
 
 RAW_COOKIE_JSON = os.getenv("EPAPER_COOKIE_JSON", "").strip()
 
-def get_authenticated_session():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Referer": "https://epaper.prothomalo.com/"
-    })
+async def main():
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    output_filename = f"prothom_alo_epaper_{today_str}.epub"
 
     if not RAW_COOKIE_JSON:
         raise Exception("EPAPER_COOKIE_JSON secret is missing from GitHub Secrets.")
 
     try:
-        cookies_data = json.loads(RAW_COOKIE_JSON)
-        for cookie in cookies_data:
-            name = cookie.get("name")
-            value = cookie.get("value")
-            domain = cookie.get("domain", ".prothomalo.com")
-            path = cookie.get("path", "/")
-            if name and value:
-                session.cookies.set(name, value, domain=domain, path=path)
-        print(f"[+] Successfully loaded {len(cookies_data)} cookies into session.")
+        cookies = json.loads(RAW_COOKIE_JSON)
     except Exception as e:
-        raise Exception(f"Failed to parse JSON cookie string: {e}")
+        raise Exception(f"Failed to parse EPAPER_COOKIE_JSON: {e}")
 
-    return session
+    page_images = {}
 
-def fetch_broadsheet_images(session):
-    base_url = "https://epaper.prothomalo.com/"
-    print(f"[*] Accessing main portal: {base_url}")
-    res = session.get(base_url, timeout=15)
-    
-    if res.status_code != 200:
-        print(f"[-] Failed to access home page. Status: {res.status_code}")
-        return []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        )
 
-    soup = BeautifulSoup(res.text, "html.parser")
-    img_urls = []
+        formatted_cookies = []
+        for c in cookies:
+            cookie_dict = {
+                "name": c.get("name"),
+                "value": c.get("value"),
+                "domain": c.get("domain", ".prothomalo.com"),
+                "path": c.get("path", "/")
+            }
+            if cookie_dict["domain"] and not cookie_dict["domain"].startswith("http"):
+                formatted_cookies.append(cookie_dict)
 
-    # Extract page scan URLs from HTML tags
-    for img in soup.find_all("img"):
-        src = img.get("src") or img.get("data-src") or img.get("data-original")
-        if src and any(k in src.lower() for k in ["page", "epaper", "edition", "uploads"]):
-            if not any(ign in src.lower() for ign in ["logo", "icon", "banner", "ad"]):
-                if not src.startswith("http"):
-                    src = "https://epaper.prothomalo.com" + ("/" if not src.startswith("/") else "") + src
-                if src not in img_urls:
-                    img_urls.append(src)
+        await context.add_cookies(formatted_cookies)
+        page = await context.new_page()
 
-    # Fallback regex extraction from embedded page scripts
-    if not img_urls:
-        matches = re.findall(r'https?://[^\s"\']+\.(?:jpg|jpeg|png|webp)', res.text, re.IGNORECASE)
-        for url in matches:
-            if any(k in url.lower() for k in ["page", "epaper", "uploads"]) and url not in img_urls:
-                img_urls.append(url)
+        # Intercept network image streams (> 30KB to bypass logos/wireframes)
+        async def handle_response(response):
+            url = response.url
+            content_type = response.headers.get("content-type", "")
+            if "image" in content_type and response.status == 200:
+                try:
+                    body = await response.body()
+                    if len(body) > 30000 and url not in page_images:
+                        page_images[url] = body
+                        print(f"[+] Intercepted page scan ({len(body)} bytes)")
+                except Exception:
+                    pass
 
-    return img_urls
+        page.on("response", handle_response)
 
-def run():
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    output_filename = f"prothom_alo_epaper_{today_str}.epub"
+        print("[*] Opening ePaper portal in headless browser...")
+        await page.goto("https://epaper.prothomalo.com/", wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(4000)
 
-    session = get_authenticated_session()
-    image_urls = fetch_broadsheet_images(session)
+        # Flip through pages to trigger network loading of all broadsheet scans
+        for page_idx in range(16):
+            await page.keyboard.press("ArrowRight")
+            await page.wait_for_timeout(1500)
 
-    print(f"[*] Discovered {len(image_urls)} broadsheet page scans.")
+        await browser.close()
+
+    image_bytes_list = list(page_images.values())
+    print(f"[*] Total valid broadsheet scans captured: {len(image_bytes_list)}")
+
+    if not image_bytes_list:
+        raise Exception("No ePaper page images captured. Please refresh your browser login cookie.")
 
     book = epub.EpubBook()
     book.set_identifier(f"prothom-alo-epaper-{today_str}")
@@ -91,41 +91,32 @@ def run():
     chapters = []
     spine = ['nav']
 
-    for i, img_url in enumerate(image_urls, start=1):
-        try:
-            res = session.get(img_url, timeout=15)
-            if res.status_code == 200 and len(res.content) > 10000:
-                img_item = epub.EpubItem(
-                    uid=f"page_img_{i}",
-                    file_name=f"images/page_{i}.jpg",
-                    media_type="image/jpeg",
-                    content=res.content
-                )
-                book.add_item(img_item)
+    for i, img_bytes in enumerate(image_bytes_list, start=1):
+        img_item = epub.EpubItem(
+            uid=f"page_img_{i}",
+            file_name=f"images/page_{i}.jpg",
+            media_type="image/jpeg",
+            content=img_bytes
+        )
+        book.add_item(img_item)
 
-                chapter = epub.EpubHtml(
-                    title=f"পাতা {i}",
-                    file_name=f"page_{i}.xhtml",
-                    lang="bn"
-                )
-                chapter.content = f"""
-                <html>
-                <head><title>পাতা {i}</title><link rel="stylesheet" href="style.css" type="text/css"/></head>
-                <body>
-                    <div class="page"><img src="images/page_{i}.jpg" alt="Page {i}"/></div>
-                </body>
-                </html>
-                """
-                chapter.add_item(css_item)
-                book.add_item(chapter)
-                chapters.append(chapter)
-                spine.append(chapter)
-                print(f"[+] Downloaded Page {i}")
-        except Exception as e:
-            print(f"[-] Error downloading page {i}: {e}")
-
-    if not chapters:
-        raise Exception("No valid ePaper pages could be extracted. Refresh your browser session cookies.")
+        chapter = epub.EpubHtml(
+            title=f"পাতা {i}",
+            file_name=f"page_{i}.xhtml",
+            lang="bn"
+        )
+        chapter.content = f"""
+        <html>
+        <head><title>পাতা {i}</title><link rel="stylesheet" href="style.css" type="text/css"/></head>
+        <body>
+            <div class="page"><img src="images/page_{i}.jpg" alt="Page {i}"/></div>
+        </body>
+        </html>
+        """
+        chapter.add_item(css_item)
+        book.add_item(chapter)
+        chapters.append(chapter)
+        spine.append(chapter)
 
     book.toc = tuple(chapters)
     book.add_item(epub.EpubNcx())
@@ -136,4 +127,4 @@ def run():
     print(f"[✓] ePaper EPUB generated successfully: {output_filename}")
 
 if __name__ == "__main__":
-    run()
+    asyncio.run(main())
