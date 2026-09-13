@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import requests
 from datetime import datetime
 from playwright.async_api import async_playwright
 from ebooklib import epub
@@ -14,17 +15,12 @@ async def main():
     if not RAW_COOKIE_JSON:
         raise Exception("EPAPER_COOKIE_JSON secret is missing from GitHub Secrets.")
 
-    try:
-        cookies = json.loads(RAW_COOKIE_JSON)
-    except Exception as e:
-        raise Exception(f"Failed to parse EPAPER_COOKIE_JSON: {e}")
-
-    page_images = {}
+    cookies = json.loads(RAW_COOKIE_JSON)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
+            viewport={"width": 1440, "height": 900},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         )
 
@@ -42,48 +38,89 @@ async def main():
         await context.add_cookies(formatted_cookies)
         page = await context.new_page()
 
-        # Intercept network image streams (> 30KB to bypass logos/wireframes)
-        async def handle_response(response):
-            url = response.url
-            content_type = response.headers.get("content-type", "")
-            if "image" in content_type and response.status == 200:
-                try:
-                    body = await response.body()
-                    if len(body) > 30000 and url not in page_images:
-                        page_images[url] = body
-                        print(f"[+] Intercepted page scan ({len(body)} bytes)")
-                except Exception:
-                    pass
-
-        page.on("response", handle_response)
-
-        print("[*] Opening ePaper portal in headless browser...")
+        print("[*] Navigating to Prothom Alo ePaper...")
         await page.goto("https://epaper.prothomalo.com/", wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(3000)
 
-        # Flip through pages to trigger network loading of all broadsheet scans
-        for page_idx in range(16):
-            await page.keyboard.press("ArrowRight")
-            await page.wait_for_timeout(1500)
+        # Extract structured article nodes directly from page context
+        articles = await page.evaluate('''() => {
+            const results = [];
+            // Target article map elements and popups
+            const elements = document.querySelectorAll('map area, .article-click, .story-box, [data-article-id]');
+            
+            elements.forEach(el => {
+                const title = el.getAttribute('title') || el.getAttribute('alt') || '';
+                const id = el.getAttribute('data-article-id') || el.getAttribute('id') || '';
+                if (title) {
+                    results.push({ title, id });
+                }
+            });
+            return results;
+        }''')
+
+        # Fallback: Extract embedded story data script tags if available
+        story_data = await page.evaluate('''() => {
+            const scripts = Array.from(document.querySelectorAll('script'));
+            for (let s of scripts) {
+                if (s.innerText.includes('articleList') || s.innerText.includes('PageArticles')) {
+                    return s.innerText;
+                }
+            }
+            return null;
+        }''')
+
+        print(f"[*] Found {len(articles)} article locations on home edition.")
+
+        # Trigger article modal views to scrape rendered headlines, body text, and images
+        scraped_stories = []
+        areas = await page.query_selector_all('map area, div.article-box, a.page-link')
+        
+        for idx, area in enumerate(areas[:25]):  # Process top articles across pages
+            try:
+                await area.click(force=True)
+                await page.wait_for_timeout(1200)
+
+                story = await page.evaluate('''() => {
+                    const modal = document.querySelector('.modal-content, .article-detail-popup, #articleModal, .story-details');
+                    if (!modal) return null;
+
+                    const title = modal.querySelector('h1, h2, .headline, .title')?.innerText.strip() || '';
+                    const imgs = Array.from(modal.querySelectorAll('img')).map(i => i.src).filter(src => src && !src.includes('logo'));
+                    const paragraphs = Array.from(modal.querySelectorAll('p, .content, .description')).map(p => p.innerText.trim()).filter(t => t.length > 0);
+
+                    return {
+                        title: title,
+                        image_url: imgs.length > 0 ? imgs[0] : null,
+                        paragraphs: paragraphs
+                    };
+                }''')
+
+                if story and (story['title'] or story['paragraphs']):
+                    scraped_stories.append(story)
+                    print(f"[+] Scraped Article: {story['title'][:40]}...")
+
+                # Close modal if open
+                close_btn = await page.query_selector('.close, .btn-close, .modal-close')
+                if close_btn:
+                    await close_btn.click()
+            except Exception:
+                continue
 
         await browser.close()
 
-    image_bytes_list = list(page_images.values())
-    print(f"[*] Total valid broadsheet scans captured: {len(image_bytes_list)}")
-
-    if not image_bytes_list:
-        raise Exception("No ePaper page images captured. Please refresh your browser login cookie.")
-
+    # Package into Kindle Reflowable EPUB
     book = epub.EpubBook()
-    book.set_identifier(f"prothom-alo-epaper-{today_str}")
-    book.set_title(f"প্রথম আলো ইপেপার - {today_str}")
+    book.set_identifier(f"prothom-alo-epaper-text-{today_str}")
+    book.set_title(f"প্রথম আলো - {today_str}")
     book.set_language("bn")
     book.add_author("দৈনিক প্রথম আলো")
 
     style = '''
-    body { background-color: #000; margin: 0; padding: 0; text-align: center; }
-    div.page { page-break-after: always; height: 100vh; display: flex; align-items: center; justify-content: center; }
-    img { max-width: 100%; max-height: 100%; height: auto; display: block; margin: auto; }
+    @namespace epub "http://www.idpf.org/2007/ops";
+    body { font-family: "Kalpurush", "SolaimanLipi", sans-serif; padding: 5%; line-height: 1.6; }
+    h1 { font-size: 1.6em; color: #111; margin-bottom: 0.5em; line-height: 1.3; }
+    img { max-width: 100%; height: auto; display: block; margin: 1em auto; }
+    p { font-size: 1.1em; text-align: justify; text-indent: 1em; margin-bottom: 0.8em; }
     '''
     css_item = epub.EpubItem(uid="style", file_name="style.css", media_type="text/css", content=style)
     book.add_item(css_item)
@@ -91,25 +128,43 @@ async def main():
     chapters = []
     spine = ['nav']
 
-    for i, img_bytes in enumerate(image_bytes_list, start=1):
-        img_item = epub.EpubItem(
-            uid=f"page_img_{i}",
-            file_name=f"images/page_{i}.jpg",
-            media_type="image/jpeg",
-            content=img_bytes
-        )
-        book.add_item(img_item)
+    # Download image dependencies & format HTML content
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    for i, story in enumerate(scraped_stories, start=1):
+        img_html = ""
+        if story.get("image_url"):
+            try:
+                res = session.get(story["image_url"], timeout=10)
+                if res.status_code == 200:
+                    img_name = f"img_{i}.jpg"
+                    img_item = epub.EpubItem(
+                        uid=f"img_{i}",
+                        file_name=f"images/{img_name}",
+                        media_type="image/jpeg",
+                        content=res.content
+                    )
+                    book.add_item(img_item)
+                    img_html = f'<img src="images/{img_name}" alt="Article Image"/>'
+            except Exception as e:
+                print(f"[-] Image download skipped for story {i}: {e}")
+
+        paras_html = "".join([f"<p>{p}</p>" for p in story["paragraphs"]])
+        title_text = story["title"] or f"সংবাদ {i}"
 
         chapter = epub.EpubHtml(
-            title=f"পাতা {i}",
-            file_name=f"page_{i}.xhtml",
+            title=title_text,
+            file_name=f"article_{i}.xhtml",
             lang="bn"
         )
         chapter.content = f"""
         <html>
-        <head><title>পাতা {i}</title><link rel="stylesheet" href="style.css" type="text/css"/></head>
+        <head><title>{title_text}</title><link rel="stylesheet" href="style.css" type="text/css"/></head>
         <body>
-            <div class="page"><img src="images/page_{i}.jpg" alt="Page {i}"/></div>
+            <h1>{title_text}</h1>
+            {img_html}
+            {paras_html}
         </body>
         </html>
         """
@@ -118,13 +173,16 @@ async def main():
         chapters.append(chapter)
         spine.append(chapter)
 
+    if not chapters:
+        raise Exception("Could not parse article text. Please verify subscription cookies.")
+
     book.toc = tuple(chapters)
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
     book.spine = spine
 
     epub.write_epub(output_filename, book, {})
-    print(f"[✓] ePaper EPUB generated successfully: {output_filename}")
+    print(f"[✓] Reflowable text+image EPUB generated: {output_filename}")
 
 if __name__ == "__main__":
     asyncio.run(main())
