@@ -39,54 +39,34 @@ async def main():
         page = await context.new_page()
 
         print("[*] Navigating to Prothom Alo ePaper...")
-        await page.goto("https://epaper.prothomalo.com/", wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(3000)
+        # Use domcontentloaded to avoid long-polling background timeouts
+        await page.goto("https://epaper.prothomalo.com/", wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(5000)
 
-        # Extract structured article nodes directly from page context
-        articles = await page.evaluate('''() => {
-            const results = [];
-            // Target article map elements and popups
-            const elements = document.querySelectorAll('map area, .article-click, .story-box, [data-article-id]');
-            
-            elements.forEach(el => {
-                const title = el.getAttribute('title') || el.getAttribute('alt') || '';
-                const id = el.getAttribute('data-article-id') || el.getAttribute('id') || '';
-                if (title) {
-                    results.push({ title, id });
-                }
-            });
-            return results;
-        }''')
-
-        # Fallback: Extract embedded story data script tags if available
-        story_data = await page.evaluate('''() => {
-            const scripts = Array.from(document.querySelectorAll('script'));
-            for (let s of scripts) {
-                if (s.innerText.includes('articleList') || s.innerText.includes('PageArticles')) {
-                    return s.innerText;
-                }
-            }
-            return null;
-        }''')
-
-        print(f"[*] Found {len(articles)} article locations on home edition.")
-
-        # Trigger article modal views to scrape rendered headlines, body text, and images
+        # Scrape clickable story blocks or map links
         scraped_stories = []
-        areas = await page.query_selector_all('map area, div.article-box, a.page-link')
-        
-        for idx, area in enumerate(areas[:25]):  # Process top articles across pages
+        areas = await page.query_selector_all('map area, div.article-box, a.page-link, [data-article-id]')
+        print(f"[*] Found {len(areas)} potential article elements.")
+
+        for idx, area in enumerate(areas[:20]):
             try:
-                await area.click(force=True)
-                await page.wait_for_timeout(1200)
+                await area.click(force=True, timeout=3000)
+                await page.wait_for_timeout(1000)
 
                 story = await page.evaluate('''() => {
-                    const modal = document.querySelector('.modal-content, .article-detail-popup, #articleModal, .story-details');
+                    const modal = document.querySelector('.modal-content, .article-detail-popup, #articleModal, .story-details, body');
                     if (!modal) return null;
 
-                    const title = modal.querySelector('h1, h2, .headline, .title')?.innerText.strip() || '';
-                    const imgs = Array.from(modal.querySelectorAll('img')).map(i => i.src).filter(src => src && !src.includes('logo'));
-                    const paragraphs = Array.from(modal.querySelectorAll('p, .content, .description')).map(p => p.innerText.trim()).filter(t => t.length > 0);
+                    const titleEl = modal.querySelector('h1, h2, .headline, .title');
+                    const title = titleEl ? titleEl.innerText.trim() : '';
+
+                    const imgs = Array.from(modal.querySelectorAll('img'))
+                        .map(i => i.src)
+                        .filter(src => src && !src.includes('logo') && !src.includes('icon'));
+
+                    const paragraphs = Array.from(modal.querySelectorAll('p, .content, .description'))
+                        .map(p => p.innerText.trim())
+                        .filter(t => t.length > 15);
 
                     return {
                         title: title,
@@ -97,12 +77,12 @@ async def main():
 
                 if story and (story['title'] or story['paragraphs']):
                     scraped_stories.append(story)
-                    print(f"[+] Scraped Article: {story['title'][:40]}...")
+                    print(f"[+] Scraped: {story['title'][:40]}...")
 
-                # Close modal if open
+                # Close modal view if open
                 close_btn = await page.query_selector('.close, .btn-close, .modal-close')
                 if close_btn:
-                    await close_btn.click()
+                    await close_btn.click(timeout=1000)
             except Exception:
                 continue
 
@@ -117,8 +97,8 @@ async def main():
 
     style = '''
     @namespace epub "http://www.idpf.org/2007/ops";
-    body { font-family: "Kalpurush", "SolaimanLipi", sans-serif; padding: 5%; line-height: 1.6; }
-    h1 { font-size: 1.6em; color: #111; margin-bottom: 0.5em; line-height: 1.3; }
+    body { font-family: "Kalpurush", "SolaimanLipi", sans-serif; padding: 4%; line-height: 1.6; }
+    h1 { font-size: 1.5em; color: #111; margin-bottom: 0.5em; line-height: 1.3; }
     img { max-width: 100%; height: auto; display: block; margin: 1em auto; }
     p { font-size: 1.1em; text-align: justify; text-indent: 1em; margin-bottom: 0.8em; }
     '''
@@ -127,8 +107,6 @@ async def main():
 
     chapters = []
     spine = ['nav']
-
-    # Download image dependencies & format HTML content
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0"})
 
@@ -147,8 +125,8 @@ async def main():
                     )
                     book.add_item(img_item)
                     img_html = f'<img src="images/{img_name}" alt="Article Image"/>'
-            except Exception as e:
-                print(f"[-] Image download skipped for story {i}: {e}")
+            except Exception:
+                pass
 
         paras_html = "".join([f"<p>{p}</p>" for p in story["paragraphs"]])
         title_text = story["title"] or f"সংবাদ {i}"
@@ -174,7 +152,7 @@ async def main():
         spine.append(chapter)
 
     if not chapters:
-        raise Exception("Could not parse article text. Please verify subscription cookies.")
+        raise Exception("Could not extract article text from portal.")
 
     book.toc = tuple(chapters)
     book.add_item(epub.EpubNcx())
