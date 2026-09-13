@@ -1,6 +1,8 @@
 import os
+import re
 import json
 import requests
+from bs4 import BeautifulSoup
 from datetime import datetime
 from ebooklib import epub
 
@@ -32,33 +34,45 @@ def get_authenticated_session():
 
     return session
 
-def download_page_image(session, today_str, page_num):
-    urls_to_try = [
-        f"https://epaper.prothomalo.com/Home/GetPageImage?date={today_str}&page={page_num}&edition=dhaka",
-        f"https://epaper.prothomalo.com/Home/GetPageImage?date={today_str}&page={page_num}",
-        f"https://epaper.prothomalo.com/Home/PageImage?date={today_str}&page={page_num}"
-    ]
+def fetch_broadsheet_images(session):
+    base_url = "https://epaper.prothomalo.com/"
+    print(f"[*] Accessing main portal: {base_url}")
+    res = session.get(base_url, timeout=15)
+    
+    if res.status_code != 200:
+        print(f"[-] Failed to access home page. Status: {res.status_code}")
+        return []
 
-    for url in urls_to_try:
-        try:
-            res = session.get(url, timeout=15)
-            content_type = res.headers.get("Content-Type", "")
-            print(f"[*] Page {page_num} attempt -> Status: {res.status_code} | Size: {len(res.content)} bytes | Type: {content_type}")
-            
-            if res.status_code == 200 and "image" in content_type.lower() and len(res.content) > 10000:
-                return res.content
-            elif "text/html" in content_type.lower() and len(res.content) < 5000:
-                print(f"[-] HTML snippet: {res.text[:150].strip()}")
-        except Exception as e:
-            print(f"[-] Request error for Page {page_num}: {e}")
+    soup = BeautifulSoup(res.text, "html.parser")
+    img_urls = []
 
-    return None
+    # Extract page scan URLs from HTML tags
+    for img in soup.find_all("img"):
+        src = img.get("src") or img.get("data-src") or img.get("data-original")
+        if src and any(k in src.lower() for k in ["page", "epaper", "edition", "uploads"]):
+            if not any(ign in src.lower() for ign in ["logo", "icon", "banner", "ad"]):
+                if not src.startswith("http"):
+                    src = "https://epaper.prothomalo.com" + ("/" if not src.startswith("/") else "") + src
+                if src not in img_urls:
+                    img_urls.append(src)
+
+    # Fallback regex extraction from embedded page scripts
+    if not img_urls:
+        matches = re.findall(r'https?://[^\s"\']+\.(?:jpg|jpeg|png|webp)', res.text, re.IGNORECASE)
+        for url in matches:
+            if any(k in url.lower() for k in ["page", "epaper", "uploads"]) and url not in img_urls:
+                img_urls.append(url)
+
+    return img_urls
 
 def run():
     today_str = datetime.now().strftime('%Y-%m-%d')
     output_filename = f"prothom_alo_epaper_{today_str}.epub"
 
     session = get_authenticated_session()
+    image_urls = fetch_broadsheet_images(session)
+
+    print(f"[*] Discovered {len(image_urls)} broadsheet page scans.")
 
     book = epub.EpubBook()
     book.set_identifier(f"prothom-alo-epaper-{today_str}")
@@ -77,41 +91,41 @@ def run():
     chapters = []
     spine = ['nav']
 
-    for page_num in range(1, 17):
-        img_data = download_page_image(session, today_str, page_num)
-        if img_data:
-            img_item = epub.EpubItem(
-                uid=f"page_img_{page_num}",
-                file_name=f"images/page_{page_num}.jpg",
-                media_type="image/jpeg",
-                content=img_data
-            )
-            book.add_item(img_item)
+    for i, img_url in enumerate(image_urls, start=1):
+        try:
+            res = session.get(img_url, timeout=15)
+            if res.status_code == 200 and len(res.content) > 10000:
+                img_item = epub.EpubItem(
+                    uid=f"page_img_{i}",
+                    file_name=f"images/page_{i}.jpg",
+                    media_type="image/jpeg",
+                    content=res.content
+                )
+                book.add_item(img_item)
 
-            chapter = epub.EpubHtml(
-                title=f"পাতা {page_num}",
-                file_name=f"page_{page_num}.xhtml",
-                lang="bn"
-            )
-            chapter.content = f"""
-            <html>
-            <head><title>পাতা {page_num}</title><link rel="stylesheet" href="style.css" type="text/css"/></head>
-            <body>
-                <div class="page"><img src="images/page_{page_num}.jpg" alt="Page {page_num}"/></div>
-            </body>
-            </html>
-            """
-            chapter.add_item(css_item)
-            book.add_item(chapter)
-            chapters.append(chapter)
-            spine.append(chapter)
-            print(f"[+] Successfully attached Page {page_num}")
-        elif page_num > 2:
-            print(f"[*] Stopping scan at page {page_num} (no further content).")
-            break
+                chapter = epub.EpubHtml(
+                    title=f"পাতা {i}",
+                    file_name=f"page_{i}.xhtml",
+                    lang="bn"
+                )
+                chapter.content = f"""
+                <html>
+                <head><title>পাতা {i}</title><link rel="stylesheet" href="style.css" type="text/css"/></head>
+                <body>
+                    <div class="page"><img src="images/page_{i}.jpg" alt="Page {i}"/></div>
+                </body>
+                </html>
+                """
+                chapter.add_item(css_item)
+                book.add_item(chapter)
+                chapters.append(chapter)
+                spine.append(chapter)
+                print(f"[+] Downloaded Page {i}")
+        except Exception as e:
+            print(f"[-] Error downloading page {i}: {e}")
 
     if not chapters:
-        raise Exception("Could not download pages. Your logged-in web session has likely expired. Re-export cookies from your browser.")
+        raise Exception("No valid ePaper pages could be extracted. Refresh your browser session cookies.")
 
     book.toc = tuple(chapters)
     book.add_item(epub.EpubNcx())
