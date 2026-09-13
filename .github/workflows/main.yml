@@ -1,15 +1,13 @@
-name: Daily Prothom Alo Print EPUB
+name: Daily Prothom Alo EPUB
 
 on:
   schedule:
-    # 01:00 UTC = 07:00 AM BST (UTC+6)
-    - cron: '0 1 * * *'
+    - cron: '0 1 * * *' # Runs daily at 7:00 AM BST
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -18,18 +16,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Build Print Edition EPUB
+      - name: Run generation script
         run: python build_epaper.py
 
-      - name: Upload Daily EPUB
+      - name: Upload generated EPUB artifact
         uses: actions/upload-artifact@v4
         with:
           name: Prothom-Alo-EPUB-${{ github.run_id }}
-          path: prothom_alo_print_*.epub
+          path: prothom_alo_*.epub
           retention-days: 7
