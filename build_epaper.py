@@ -1,109 +1,126 @@
 import os
 import json
-import asyncio
 import requests
+from bs4 import BeautifulSoup
 from datetime import datetime
-from playwright.async_api import async_playwright
 from ebooklib import epub
 
 RAW_COOKIE_JSON = os.getenv("EPAPER_COOKIE_JSON", "").strip()
 
-async def main():
+def get_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Referer": "https://epaper.prothomalo.com/"
+    })
+
+    if RAW_COOKIE_JSON:
+        try:
+            cookies = json.loads(RAW_COOKIE_JSON)
+            for c in cookies:
+                name = c.get("name")
+                value = c.get("value")
+                domain = c.get("domain", ".prothomalo.com")
+                path = c.get("path", "/")
+                if name and value:
+                    session.cookies.set(name, value, domain=domain, path=path)
+            print(f"[+] Loaded {len(cookies)} cookies into session.")
+        except Exception as e:
+            print(f"[-] Cookie warning: {e}")
+
+    return session
+
+def fetch_stories(session):
+    stories = []
+    
+    # 1. Direct ePaper API / RSS Feed extraction
+    feed_urls = [
+        "https://www.prothomalo.com/feed",
+        "https://epaper.prothomalo.com/rss/edition"
+    ]
+
+    for feed in feed_urls:
+        try:
+            res = session.get(feed, timeout=15)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.content, "xml")
+                items = soup.find_all("item")
+                for item in items:
+                    title = item.find("title")
+                    desc = item.find("description")
+                    enc = item.find("enclosure")
+                    
+                    img_url = enc.get("url") if enc and enc.has_attr("url") else None
+                    title_text = title.get_text(strip=True) if title else ""
+                    
+                    paras = []
+                    if desc:
+                        body_soup = BeautifulSoup(desc.get_text(), "html.parser")
+                        paras = [p.get_text(strip=True) for p in body_soup.find_all(["p", "div"]) if len(p.get_text(strip=True)) > 15]
+                        if not paras and body_soup.get_text(strip=True):
+                            paras = [body_soup.get_text(strip=True)]
+
+                    if title_text and paras:
+                        stories.append({
+                            "title": title_text,
+                            "image_url": img_url,
+                            "paragraphs": paras
+                        })
+                if stories:
+                    break
+        except Exception as e:
+            print(f"[-] Feed scan error: {e}")
+
+    # 2. Web Portal Fallback Scraper
+    if not stories:
+        print("[*] Fetching frontpage articles directly from website portal...")
+        try:
+            res = session.get("https://www.prothomalo.com/", timeout=15)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.text, "html.parser")
+                links = soup.find_all("a", href=True)
+                article_urls = list(set([l["href"] for l in links if "/bangladesh/" in l["href"] or "/international/" in l["href"] or "/sports/" in l["href"]]))
+
+                for url in article_urls[:30]:
+                    if not url.startswith("http"):
+                        url = "https://www.prothomalo.com" + url
+                    try:
+                        art_res = session.get(url, timeout=8)
+                        if art_res.status_code == 200:
+                            art_soup = BeautifulSoup(art_res.text, "html.parser")
+                            h1 = art_soup.find("h1")
+                            p_tags = [p.get_text(strip=True) for p in art_soup.find_all("p") if len(p.get_text(strip=True)) > 20]
+                            img = art_soup.find("img")
+                            img_src = img.get("src") if img else None
+
+                            if h1 and p_tags:
+                                stories.append({
+                                    "title": h1.get_text(strip=True),
+                                    "image_url": img_src,
+                                    "paragraphs": p_tags
+                                })
+                    except Exception:
+                        continue
+        except Exception as e:
+            print(f"[-] Portal scraper error: {e}")
+
+    return stories
+
+def main():
     today_str = datetime.now().strftime('%Y-%m-%d')
     output_filename = f"prothom_alo_epaper_{today_str}.epub"
 
-    if not RAW_COOKIE_JSON:
-        raise Exception("EPAPER_COOKIE_JSON secret is missing from GitHub Secrets.")
+    session = get_session()
+    stories = fetch_stories(session)
 
-    cookies = json.loads(RAW_COOKIE_JSON)
+    print(f"[*] Total reflowable articles parsed: {len(stories)}")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            viewport={"width": 1440, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        )
+    if not stories:
+        raise Exception("Could not retrieve news articles. Check internet access or cookies.")
 
-        formatted_cookies = []
-        for c in cookies:
-            cookie_dict = {
-                "name": c.get("name"),
-                "value": c.get("value"),
-                "domain": c.get("domain", ".prothomalo.com"),
-                "path": c.get("path", "/")
-            }
-            if cookie_dict["domain"] and not cookie_dict["domain"].startswith("http"):
-                formatted_cookies.append(cookie_dict)
-
-        await context.add_cookies(formatted_cookies)
-        page = await context.new_page()
-
-        scraped_stories = []
-
-        # Intercept JSON article payloads directly from backend network traffic
-        async def handle_response(response):
-            try:
-                content_type = response.headers.get("content-type", "")
-                if "json" in content_type and response.status == 200:
-                    if any(k in response.url.lower() for k in ["article", "story", "getpage", "details"]):
-                        data = await response.json()
-                        items = data if isinstance(data, list) else [data]
-                        for item in items:
-                            title = item.get("Headline") or item.get("title") or item.get("Title") or ""
-                            content = item.get("Body") or item.get("content") or item.get("Description") or ""
-                            img = item.get("ImageUrl") or item.get("image") or None
-                            if title or content:
-                                scraped_stories.append({
-                                    "title": str(title).strip(),
-                                    "image_url": img,
-                                    "paragraphs": [p.strip() for p in str(content).split("\n") if len(p.strip()) > 10]
-                                })
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
-
-        print("[*] Loading Prothom Alo ePaper portal...")
-        await page.goto("https://epaper.prothomalo.com/", wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(6000)
-
-        # Fallback: Scrape rendered article nodes directly from DOM
-        if not scraped_stories:
-            print("[*] Parsing story blocks from browser DOM...")
-            dom_stories = await page.evaluate('''() => {
-                const results = [];
-                const blocks = document.querySelectorAll('article, .story-box, .article-content, .page-story, map area, div[data-article-id]');
-                
-                blocks.forEach(b => {
-                    const title = b.getAttribute('title') || b.getAttribute('alt') || b.querySelector('h1, h2, h3, .title, .headline')?.innerText.trim() || '';
-                    const img = b.querySelector('img')?.src || null;
-                    const paras = Array.from(b.querySelectorAll('p, .desc')).map(p => p.innerText.trim()).filter(t => t.length > 15);
-                    
-                    if (title.length > 3 || paras.length > 0) {
-                        results.push({
-                            title: title,
-                            image_url: img,
-                            paragraphs: paras
-                        });
-                    }
-                });
-                return results;
-            }''')
-
-            for s in dom_stories:
-                if not any(existing['title'] == s['title'] for existing in scraped_stories if s['title']):
-                    scraped_stories.append(s)
-
-        await browser.close()
-
-    print(f"[*] Total reflowable articles retrieved: {len(scraped_stories)}")
-
-    if not scraped_stories:
-        raise Exception("Could not extract article text. Please verify subscription login cookies.")
-
-    # Build Kindle Reflowable EPUB
     book = epub.EpubBook()
-    book.set_identifier(f"prothom-alo-epaper-text-{today_str}")
+    book.set_identifier(f"prothom-alo-text-{today_str}")
     book.set_title(f"প্রথম আলো - {today_str}")
     book.set_language("bn")
     book.add_author("দৈনিক প্রথম আলো")
@@ -120,14 +137,12 @@ async def main():
 
     chapters = []
     spine = ['nav']
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0"})
 
-    for i, story in enumerate(scraped_stories, start=1):
+    for i, story in enumerate(stories, start=1):
         img_html = ""
         if story.get("image_url") and str(story["image_url"]).startswith("http"):
             try:
-                res = session.get(story["image_url"], timeout=10)
+                res = session.get(story["image_url"], timeout=8)
                 if res.status_code == 200:
                     img_name = f"img_{i}.jpg"
                     img_item = epub.EpubItem(
@@ -142,7 +157,7 @@ async def main():
                 pass
 
         paras_html = "".join([f"<p>{p}</p>" for p in story["paragraphs"]])
-        title_text = story["title"] or f"সংবাদ {i}"
+        title_text = story["title"]
 
         chapter = epub.EpubHtml(
             title=title_text,
@@ -170,7 +185,7 @@ async def main():
     book.spine = spine
 
     epub.write_epub(output_filename, book, {})
-    print(f"[✓] Reflowable EPUB created: {output_filename}")
+    print(f"[✓] Successfully built reflowable EPUB: {output_filename}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
