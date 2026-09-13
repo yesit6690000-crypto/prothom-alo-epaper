@@ -22,8 +22,7 @@ jobs:
 
       - name: Run ePaper Scraper
         env:
-          EPAPER_USER: ${{ secrets.EPAPER_USER }}
-          EPAPER_PASS: ${{ secrets.EPAPER_PASS }}
+          EPAPER_COOKIE_JSON: ${{ secrets.EPAPER_COOKIE_JSON }}
         run: python build_epaper.py
 
       - name: Upload EPUB Artifact
