@@ -1,52 +1,34 @@
 import os
+import json
 import requests
-from bs4 import BeautifulSoup
 from datetime import datetime
 from ebooklib import epub
 
-USERNAME = os.getenv("EPAPER_USER", "").strip()
-PASSWORD = os.getenv("EPAPER_PASS", "").strip()
+RAW_COOKIE_JSON = os.getenv("EPAPER_COOKIE_JSON", "").strip()
 
 def get_authenticated_session():
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
-        "Referer": "https://epaper.prothomalo.com/Account/Login"
+        "Referer": "https://epaper.prothomalo.com/"
     })
 
-    login_url = "https://epaper.prothomalo.com/Account/Login"
+    if not RAW_COOKIE_JSON:
+        raise Exception("EPAPER_COOKIE_JSON secret is missing from GitHub Secrets.")
 
-    print("[*] Requesting login page for verification token...")
-    get_res = session.get(login_url, timeout=15)
-    
-    if get_res.status_code == 403 or "cloudflare" in get_res.text.lower():
-        print("[!] GitHub runner IP is being blocked by Cloudflare security.")
-        
-    soup = BeautifulSoup(get_res.text, "html.parser")
-    token_tag = soup.find("input", {"name": "__RequestVerificationToken"})
-    token_val = token_tag.get("value", "") if token_tag else ""
+    try:
+        cookies_data = json.loads(RAW_COOKIE_JSON)
+        for cookie in cookies_data:
+            name = cookie.get("name")
+            value = cookie.get("value")
+            domain = cookie.get("domain", ".prothomalo.com")
+            path = cookie.get("path", "/")
+            if name and value:
+                session.cookies.set(name, value, domain=domain, path=path)
+        print(f"[+] Successfully loaded {len(cookies_data)} cookies into session.")
+    except Exception as e:
+        raise Exception(f"Failed to parse JSON cookie string: {e}")
 
-    login_data = {
-        "__RequestVerificationToken": token_val,
-        "UserName": USERNAME,
-        "Password": PASSWORD,
-        "RememberMe": "true"
-    }
-
-    print(f"[*] Submitting login for account target...")
-    res = session.post(login_url, data=login_data, timeout=15)
-
-    print(f"[*] Status Code: {res.status_code}")
-    print(f"[*] Final URL: {res.url}")
-
-    cookies = session.cookies.get_dict()
-    if ".ASPXAUTH" not in cookies and "Logout" not in res.text and "logout" not in res.text.lower():
-        print(f"[-] Server response snippet: {res.text[:250]}")
-        raise Exception("Login failed. Check logs above for response details.")
-
-    print("[+] Login successful! Active session established.")
     return session
 
 def run():
@@ -111,7 +93,7 @@ def run():
                 break
 
     if not chapters:
-        raise Exception("Could not download pages. Verify subscription status or account credentials.")
+        raise Exception("Could not download pages. Please refresh your JSON cookies.")
 
     book.toc = tuple(chapters)
     book.add_item(epub.EpubNcx())
