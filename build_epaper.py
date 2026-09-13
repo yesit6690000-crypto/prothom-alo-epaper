@@ -1,49 +1,68 @@
 import os
 import requests
+import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from datetime import datetime
 from ebooklib import epub
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "bn,en-US;q=0.7,en;q=0.3"
 }
 
-def clean_filename(name):
-    return "".join(c for c in name if c.isalnum() or c in (' ', '_', '-')).rstrip()
+FEEDS = [
+    ("বাংলাদেশ", "https://www.prothomalo.com/feed/bangladesh"),
+    ("আন্তর্জাতিক", "https://www.prothomalo.com/feed/world"),
+    ("বাণিজ্য", "https://www.prothomalo.com/feed/business"),
+    ("মতামত", "https://www.prothomalo.com/feed/opinion"),
+    ("খেলা", "https://www.prothomalo.com/feed/sports"),
+    ("বিনোদন", "https://www.prothomalo.com/feed/entertainment"),
+]
 
-def fetch_print_edition():
+def fetch_feed_urls():
+    articles = []
+    for section_name, feed_url in FEEDS:
+        try:
+            resp = requests.get(feed_url, headers=HEADERS, timeout=15)
+            if resp.status_code == 200:
+                root = ET.fromstring(resp.content)
+                for item in root.findall(".//item"):
+                    title_elem = item.find("title")
+                    link_elem = item.find("link")
+                    if title_elem is not None and link_elem is not None:
+                        articles.append({
+                            "section": section_name,
+                            "title": title_elem.text.strip(),
+                            "url": link_elem.text.strip()
+                        })
+        except Exception as e:
+            print(f"[-] Could not read feed {section_name}: {e}")
+    return articles
+
+def generate_epub():
     today_str = datetime.now().strftime('%Y-%m-%d')
     output_filename = f"prothom_alo_print_{today_str}.epub"
+    print(f"[*] Fetching Prothom Alo news for {today_str}...")
+
+    all_items = fetch_feed_urls()
     
-    print(f"[*] Fetching Prothom Alo Print Edition for {today_str}...")
+    # Deduplicate by URL
+    seen_urls = set()
+    unique_articles = []
+    for item in all_items:
+        if item["url"] not in seen_urls:
+            seen_urls.add(item["url"])
+            unique_articles.append(item)
 
-    # The official Print Edition (ছাপা সংস্করণ) portal
-    target_url = "https://www.prothomalo.com/collection/print-edition"
-    resp = requests.get(target_url, headers=HEADERS, timeout=30)
-    if resp.status_code != 200:
-        raise Exception(f"Failed to access {target_url} (HTTP {resp.status_code})")
+    print(f"[*] Found {len(unique_articles)} articles across all categories.")
 
-    soup = BeautifulSoup(resp.text, 'lxml')
-
-    # Collect article links
-    links = []
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        if any(keyword in href for keyword in ['/bangladesh/', '/international/', '/business/', '/opinion/', '/sports/', '/entertainment/']):
-            full_url = href if href.startswith("http") else f"https://www.prothomalo.com{href}"
-            if full_url not in links:
-                links.append(full_url)
-
-    print(f"[*] Found {len(links)} print edition articles. Extracting...")
-
-    # Initialize Reflowable EPUB
     book = epub.EpubBook()
-    book.set_identifier(f"prothom-alo-print-{today_str}")
-    book.set_title(f"প্রথম আলো ছাপা সংস্করণ - {today_str}")
+    book.set_identifier(f"prothom-alo-{today_str}")
+    book.set_title(f"প্রথম আলো - {today_str}")
     book.set_language("bn")
-    book.add_author("Prothom Alo")
+    book.add_author("দৈনিক প্রথম আলো")
 
-    # Global Bengali styling for e-readers
     style = '''
     @namespace epub "http://www.idpf.org/2007/ops";
     body {
@@ -55,8 +74,13 @@ def fetch_print_edition():
     h1 {
         font-size: 1.6em;
         line-height: 1.3;
-        margin-bottom: 0.5em;
+        margin-bottom: 0.3em;
         color: #111;
+    }
+    .meta {
+        color: #666;
+        font-size: 0.9em;
+        margin-bottom: 1.5em;
     }
     img {
         max-width: 100%;
@@ -77,83 +101,75 @@ def fetch_print_edition():
     spine = ['nav']
     img_counter = 1
 
-    # Extract text and photos from articles (up to 35 top articles)
-    for idx, url in enumerate(links[:35], start=1):
+    # Extract up to 30 top articles
+    for idx, art in enumerate(unique_articles[:30], start=1):
         try:
-            art_resp = requests.get(url, headers=HEADERS, timeout=15)
+            art_resp = requests.get(art["url"], headers=HEADERS, timeout=12)
             if art_resp.status_code != 200:
                 continue
-            
-            art_soup = BeautifulSoup(art_resp.text, 'lxml')
-            
-            # Extract title
-            title_tag = art_soup.find(['h1', 'title'])
-            if not title_tag:
-                continue
-            title = title_tag.get_text().strip()
-            if not title or "Prothom Alo" in title and len(title) < 15:
-                continue
 
-            # Extract body paragraphs
+            soup = BeautifulSoup(art_resp.text, 'lxml')
+
+            # Extract body content from story container
+            story_div = soup.find('div', class_=lambda c: c and 'story-element' in c) or soup.find('article') or soup
             paragraphs = []
-            for p in art_soup.find_all('p'):
+            for p in story_div.find_all('p'):
                 text = p.get_text().strip()
-                if len(text) > 30 and "বিজ্ঞাপন" not in text:
+                if len(text) > 25 and "বিজ্ঞাপন" not in text:
                     paragraphs.append(f"<p>{text}</p>")
 
             if not paragraphs:
                 continue
 
-            # Extract featured image
+            # Extract lead image
             img_html = ""
-            img_tag = art_soup.find('img', src=True)
-            if img_tag:
+            img_tag = soup.find('img', src=lambda s: s and ('media' in s or 'images' in s))
+            if img_tag and img_tag.get('src'):
                 img_url = img_tag['src']
                 if img_url.startswith("//"):
                     img_url = "https:" + img_url
-                if img_url.startswith("http") and any(ext in img_url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
-                    try:
-                        img_data = requests.get(img_url, headers=HEADERS, timeout=10).content
-                        img_item = epub.EpubItem(
-                            uid=f"img_{img_counter}",
-                            file_name=f"images/img_{img_counter}.jpg",
-                            media_type="image/jpeg",
-                            content=img_data
-                        )
-                        book.add_item(img_item)
-                        img_html = f'<p><img src="images/img_{img_counter}.jpg" alt="Article image"/></p>'
-                        img_counter += 1
-                    except Exception:
-                        pass
+                try:
+                    img_data = requests.get(img_url, headers=HEADERS, timeout=8).content
+                    img_item = epub.EpubItem(
+                        uid=f"img_{img_counter}",
+                        file_name=f"images/img_{img_counter}.jpg",
+                        media_type="image/jpeg",
+                        content=img_data
+                    )
+                    book.add_item(img_item)
+                    img_html = f'<p><img src="images/img_{img_counter}.jpg" alt="Image"/></p>'
+                    img_counter += 1
+                except Exception:
+                    pass
 
-            # Construct chapter page
-            content = f"""
+            html_content = f"""
             <html>
             <head>
-                <title>{title}</title>
+                <title>{art['title']}</title>
                 <link rel="stylesheet" href="style/default.css" type="text/css"/>
             </head>
             <body>
-                <h1>{title}</h1>
+                <div class="meta">বিভাগ: {art['section']}</div>
+                <h1>{art['title']}</h1>
                 {img_html}
                 {''.join(paragraphs)}
             </body>
             </html>
             """
 
-            chapter = epub.EpubHtml(title=title, file_name=f"article_{idx}.xhtml", lang="bn")
-            chapter.content = content
+            chapter = epub.EpubHtml(title=art['title'], file_name=f"article_{idx}.xhtml", lang="bn")
+            chapter.content = html_content
             chapter.add_item(default_css)
             book.add_item(chapter)
             chapters.append(chapter)
             spine.append(chapter)
-            print(f"[+] Added article {idx}: {title[:40]}...")
+            print(f"[+] Added ({art['section']}): {art['title'][:40]}...")
 
         except Exception as e:
-            print(f"[-] Skipped article {url}: {e}")
+            print(f"[-] Error parsing {art['url']}: {e}")
 
     if not chapters:
-        raise Exception("No article content could be extracted.")
+        raise Exception("Could not collect any articles.")
 
     book.toc = tuple(chapters)
     book.add_item(epub.EpubNcx())
@@ -161,7 +177,7 @@ def fetch_print_edition():
     book.spine = spine
 
     epub.write_epub(output_filename, book, {})
-    print(f"[✓] Successfully generated reflowable EPUB: {output_filename}")
+    print(f"[✓] EPUB ready: {output_filename}")
 
 if __name__ == "__main__":
-    fetch_print_edition()
+    generate_epub()
